@@ -23,7 +23,10 @@ const PORT = process.env.INTEL_PORT || 4000;
 // §1 — CONFIGURATION
 // ════════════════════════════════════════════════════
 
-const SDN_CSV_URL = 'https://data.opensanctions.org/datasets/latest/us_ofac_sdn/targets.simple.csv';
+const SDN_CSV_URLS = [
+  'https://data.opensanctions.org/datasets/latest/us_ofac_sdn/targets.simple.csv',
+  'https://sanctionslistservice.ofac.treas.gov/api/PublicationPreview/exports/SDN.CSV',
+];
 const WIKIDATA_ENDPOINT = 'https://query.wikidata.org/sparql';
 const WIKIDATA_UA = 'OSIRIS-Intel/1.0 (https://osirisai.live; ontology engine)';
 const SDN_REFRESH_MS = 24 * 60 * 60 * 1000; // 24h
@@ -63,52 +66,104 @@ function parseCsv(text) {
   return rows;
 }
 
+function splitSemicolon(value) {
+  return (value || '').split(';').map(s => s.trim()).filter(Boolean);
+}
+
+function buildIndexFromEntries(entries) {
+  const byNorm = new Map();
+  for (const entry of entries) {
+    const keys = new Set([entry.name, ...(entry.aliases || [])].map(normName));
+    for (const key of keys) {
+      if (!key) continue;
+      if (!byNorm.has(key)) byNorm.set(key, []);
+      byNorm.get(key).push(entry);
+    }
+  }
+  return byNorm;
+}
+
 async function loadSanctions() {
   console.log('[INTEL] Loading OpenSanctions OFAC SDN...');
   try {
-    const res = await fetch(SDN_CSV_URL, {
-      signal: AbortSignal.timeout(30000),
-      headers: { Accept: 'text/csv' },
-    });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const text = await res.text();
+    let text = null;
+    let lastError = null;
+    for (const url of SDN_CSV_URLS) {
+      try {
+        const res = await fetch(url, {
+          signal: AbortSignal.timeout(30000),
+          headers: { Accept: 'text/csv' },
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        text = await res.text();
+        console.log(`[INTEL] Sanctions source OK: ${url}`);
+        break;
+      } catch (err) {
+        lastError = err;
+        console.warn(`[INTEL] Sanctions source failed: ${url} — ${err.message}`);
+      }
+    }
+    if (!text) throw lastError || new Error('No sanctions source available');
+
     const rows = parseCsv(text);
     if (rows.length < 2) throw new Error('CSV empty');
 
-    const headers = rows[0];
+    const headers = rows[0] || [];
     const idx = (col) => headers.indexOf(col);
-    const i = {
-      id: idx('id'), schema: idx('schema'), name: idx('name'),
-      aliases: idx('aliases'), countries: idx('countries'),
-      programs: idx('program_ids'), sanctions: idx('sanctions'),
-      first_seen: idx('first_seen'), last_seen: idx('last_seen'),
-    };
+    const hasOpenSanctionsHeader = headers.includes('name') && headers.includes('id');
 
     const entries = [];
-    const byNorm = new Map();
 
-    for (let r = 1; r < rows.length; r++) {
-      const row = rows[r];
-      if (!row[i.name]) continue;
-      const entry = {
-        id: row[i.id] || '',
-        schema: row[i.schema] || 'LegalEntity',
-        name: row[i.name],
-        aliases: (row[i.aliases] || '').split(';').map(s => s.trim()).filter(Boolean),
-        countries: (row[i.countries] || '').split(';').map(s => s.trim()).filter(Boolean),
-        programs: (row[i.programs] || '').split(';').map(s => s.trim()).filter(Boolean),
-        sanctions: row[i.sanctions] || '',
-        first_seen: i.first_seen >= 0 ? row[i.first_seen] : undefined,
+    if (hasOpenSanctionsHeader) {
+      const i = {
+        id: idx('id'), schema: idx('schema'), name: idx('name'),
+        aliases: idx('aliases'), countries: idx('countries'),
+        programs: idx('program_ids'), sanctions: idx('sanctions'),
+        first_seen: idx('first_seen'),
       };
-      entries.push(entry);
 
-      const keys = new Set([entry.name, ...entry.aliases].map(normName));
-      for (const key of keys) {
-        if (!key) continue;
-        if (!byNorm.has(key)) byNorm.set(key, []);
-        byNorm.get(key).push(entry);
+      for (let r = 1; r < rows.length; r++) {
+        const row = rows[r];
+        if (!row[i.name]) continue;
+        entries.push({
+          id: row[i.id] || '',
+          schema: row[i.schema] || 'LegalEntity',
+          name: row[i.name],
+          aliases: splitSemicolon(row[i.aliases]),
+          countries: splitSemicolon(row[i.countries]),
+          programs: splitSemicolon(row[i.programs]),
+          sanctions: row[i.sanctions] || '',
+          first_seen: i.first_seen >= 0 ? row[i.first_seen] : undefined,
+        });
+      }
+    } else {
+      // OFAC SDN CSV fallback (no header row). Common shape:
+      // [id, name, type, programs/country bucket, ... , remarks]
+      for (const row of rows) {
+        const id = (row[0] || '').trim();
+        const name = (row[1] || '').trim();
+        if (!id || !name) continue;
+
+        const schemaRaw = (row[2] || '').trim().toLowerCase();
+        const schema = schemaRaw.includes('individual') || schemaRaw.includes('person') ? 'Person' : 'LegalEntity';
+        const country = (row[3] || '').trim();
+        const remarks = (row[row.length - 1] || '').trim();
+
+        entries.push({
+          id,
+          schema,
+          name,
+          aliases: [],
+          countries: country ? [country] : [],
+          programs: [],
+          sanctions: 'OFAC SDN',
+          first_seen: undefined,
+          remarks,
+        });
       }
     }
+
+    const byNorm = buildIndexFromEntries(entries);
 
     sanctionsIndex = { entries, byNorm, fetchedAt: Date.now() };
     console.log(`[INTEL] Sanctions index loaded: ${entries.length} entities, ${byNorm.size} name keys`);
